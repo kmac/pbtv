@@ -5,7 +5,6 @@ set -o pipefail; # Catch the error in case a piped command fails
 # set -o errexit;  # Exit on error. Append "|| true" if you expect an error. Same as 'set -e'
 # set -o errtrace; # Exit on error inside any functions or subshells. Same as 'set -E'
 # set -o xtrace;   # Turn on traces, useful while debugging (short form: on: 'set -x' off: 'set +x')
-# set +o posix     # Turn off posix mode. Required for process substitution
 
 ################################################################################
 # Helpers
@@ -98,8 +97,20 @@ check_dependency() {
 }
 
 is_file_open() {
+  local filename=$1
   if hash lsof 2>&-; then
-    lsof 2>/dev/null | grep -q "$1"
+    log_debug "Checking open: $filename"
+    local -i count
+    count=$(lsof 2>/dev/null | grep -c "$filename")
+    if [ $count -gt 0 ]; then
+      log_debug "File is open: $filename"
+      return 0
+    fi
+    log_debug "File is not open: $filename"
+    return 1
+  else
+    log_warn "lsof is not found in path (assuming file is not open)"
+    return 1
   fi
 }
 
@@ -133,8 +144,9 @@ do_ffmpeg() {
     fi
     if ! is_file_open "${video_file}"; then
       echo "file $video_file" >> input.txt
+      log_debug "Including file $video_file"
     else
-      log_warn "File '$video_file' is open (excluding)"
+      log_warn "File $video_file is open (excluding)"
     fi
   done
 
@@ -153,7 +165,9 @@ do_ffmpeg() {
   log_debug "${video_file_base}.ts:"
   log_debug "$(ls -alFh "${video_file_base}.ts")"
   rm "${video_file_base}.ts"
-  rm input.txt
+  if [ -z "$DEBUG" ]; then
+    rm input.txt
+  fi
 
   if [ -n "$delete" ]; then
     log_progress "Removing original files"
