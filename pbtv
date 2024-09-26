@@ -1,0 +1,299 @@
+#!/bin/bash
+# vim: set filetype=sh:
+# shellcheck disable=SC2236
+set -o nounset;  # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o pipefail; # Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+# set -o errexit;  # Exit on error. Append "|| true" if you expect an error.
+# set -o errtrace; # Exit on error inside any functions or subshells.
+# set -o xtrace;   # Turn on traces, useful while debugging but commented out by default
+
+PBTV_DEFAULT_PLAYER=${PBTV_DEFAULT_PLAYER:-mpv}
+PBTV_DEFAULT_QUALITY=${PBTV_DEFAULT_QUALITY:-best}
+STREAMLINK_PLUGIN_DIR=${STREAMLINK_PLUGIN_DIR:-${HOME}/.local/share/streamlink/plugins}
+
+################################################################################
+# Helpers
+
+# shellcheck disable=SC2155
+readonly SCRIPTNAME=$(basename "$0")
+# shellcheck disable=SC2155
+readonly SCRIPTDIR=$(readlink -m "$(dirname "$0")")
+# shellcheck disable=SC2155
+readonly SCRIPTBASE=$(basename "$0" .sh)
+
+readonly PID_FILE=/tmp/"${SCRIPTBASE}.pid"
+readonly RECORDING_SEMAPHORE=/tmp/"${SCRIPTBASE}.recording"
+
+OUTPUTFILE_BASE=
+DEBUG=
+
+help() {
+cat <<EOF
+Launch pickleballtv stream using video player, or record to file.
+
+Requires:
+- streamlink
+- pickleballtv streamlink plugin, from this repo (see README.md)
+
+Notes:
+The streamlink application exits when a stream switches. This happens on
+commercial breaks. We handle this by starting a new .ts file. You can use the
+'tsmerge' script to merge the .ts files into one .mp4.
+
+Optionally, the manual way to convert a .ts to .mp4:
+
+    ffmpeg -i file.ts -acodec copy -vcodec copy file.mp4
+
+USAGE:
+usage: $(basename "$0")
+  $SCRIPTNAME  [-h|--help] [-d|--duration <mins>] [-r|--record] [-p|--player <player>] [-q|--quality <quality>]
+
+OPTIONS:
+  --install               : Install the streamlink plugin in ~/.local/share/streamlink/plugins
+
+  -d|--duration <mins>    : Stop after given number of minutes [default: record forever]
+  -p|--player <player>    : Use given player (default: $PBTV_DEFAULT_PLAYER)
+  -q|--quality <quality>  : 240p/worst, 360p, 480p, 720p, 1080p/best (default: best)
+  -r|--record             : Save to file [default: file named by timestamp]
+  -s|--sleep-until <date/time>
+                          : Sleep until the given date/time before starting.
+                            <date/time>: A flexible date string, as parsed by '/bin/date --date'.
+                            e.g. '3pm' '16:30' '4:30pm' '2am tomorrow' '3pm monday' 'monday 3pm'
+
+  -h|--help               : Print this help
+
+EXAMPLES:
+  $SCRIPTNAME --install   # install the pickleballtv streamlink plugin
+  $SCRIPTNAME -r -d 180   # record for 180 minutes (3 hours)
+
+  # beginning saturday at 10am, record for 5 hours, using 720p quality:
+  $SCRIPTNAME -s 'saturday 10am' -r -d 300 -q 720p
+EOF
+exit 0
+}
+
+die() { >&2 colorecho red "FATAL: $*"; exit 1; }
+die_with_rc() { local rc=$1; shift; >&2 colorecho red "FATAL: $*, rc=$rc"; exit "$rc"; }
+check_rc_die() { local rc=$1; shift; [ "$rc" -ne 0 ] && die_with_rc "$rc" "$@"; }
+log_error() { >&2 colorecho red "ERROR: $*"; }
+log_warn() { >&2 colorecho orange "$*"; }
+log_info() { >&2 echo "$*"; }
+get_logdate() { date '+%Y-%m-%d %H:%M:%S'; }  # eg: log_info "$(get_logdate) My log message"
+log_debug() { if [ -n "$DEBUG" ]; then >&2 echo "DEBUG: $*"; fi; }
+log_progress() { >&2 colorecho green "$*"; }
+
+colorecho() {  # usage: colorecho <colour> <text> or colorecho -n <colour> <text>
+  local echo_arg=
+  if [ "$1" = "-n" ]; then echo_arg="-n"; shift; fi
+  local colour="$1"; shift
+  case "${colour}" in
+    red) echo $echo_arg -e "$(tput setaf 1)$*$(tput sgr0)"; ;;
+    green) echo $echo_arg -e "$(tput setaf 2)$*$(tput sgr0)"; ;;
+    green-bold) echo $echo_arg -e "$(tput setaf 2; tput bold)$*$(tput sgr0)"; ;;
+    yellow) echo $echo_arg -e "$(tput setaf 3; tput bold)$*$(tput sgr0)"; ;;
+    orange) echo $echo_arg -e "$(tput setaf 3)$*$(tput sgr0)"; ;;
+    blue) echo $echo_arg -e "$(tput setaf 4)$*$(tput sgr0)"; ;;
+    purple) echo $echo_arg -e "$(tput setaf 5)$*$(tput sgr0)"; ;;
+    cyan) echo $echo_arg -e "$(tput setaf 6)$*$(tput sgr0)"; ;;
+    bold) echo $echo_arg -e "$(tput bold)$*$(tput sgr0)"; ;;
+    normal|*) echo $echo_arg -e "$*"; ;;
+  esac
+}
+
+handle_ctrl_c() {
+  local rc=$?
+  log_progress "Control-c was pressed"
+  shutdown_recording $rc
+}
+trap handle_ctrl_c INT
+
+handle_abnormal_exit() {
+  local rc=$?
+  log_warn "Handling abnormal exit, code=$rc"
+  shutdown_recording $rc
+}
+trap handle_abnormal_exit QUIT TERM
+
+do_install() {
+  if [ ! -d "$STREAMLINK_PLUGIN_DIR" ]; then
+    mkdir -p "$STREAMLINK_PLUGIN_DIR"
+    check_rc_die $? "Failed to create $STREAMLINK_PLUGIN_DIR"
+  fi
+  if [ ! -f "$SCRIPTDIR/streamlink/plugins/pickleballtv.py" ]; then
+    die "Could not find streamlink/plugins/pickleballtv.py in $SCRIPTDIR"
+  fi
+  if [ -f "$STREAMLINK_PLUGIN_DIR/pickleballtv.py" ]; then
+    log_info "Install aborted: $STREAMLINK_PLUGIN_DIR/pickleballtv.py already exists"
+    return
+  fi
+  cp "$SCRIPTDIR/streamlink/plugins/pickleballtv.py" "$STREAMLINK_PLUGIN_DIR"/
+  check_rc_die $? "Failed to copy plugin"
+  log_info "Finished installing pickleballtv streamlink plugin in $STREAMLINK_PLUGIN_DIR"
+}
+
+sleep_until() { 
+  local datetimestr=${1:-""}
+  [ -z "$datetimestr" ] && printf "Enter a date: " && read -r datetimestr
+  local converted_date sleep_secs
+  converted_date=$(date --date "$datetimestr")
+  sleep_secs=$(( $(date --date "$converted_date" +%s) - $(date +%s) ))
+  if [ $sleep_secs -lt 0 ]; then
+    die "given date is in the past: $datetimestr"
+  fi
+  log_progress "Sleeping until $converted_date [$sleep_secs secs]"
+  sleep $sleep_secs
+}
+
+shutdown_recording() {
+  local rc=$1
+  log_info "$(get_logdate) Shutting down, exit=$rc"
+  if [ -f "$RECORDING_SEMAPHORE" ]; then
+    log_info "Cleaning up $RECORDING_SEMAPHORE"
+    rm "$RECORDING_SEMAPHORE"
+  fi
+  log_info "Killing streamlink"
+  pkill streamlink
+  if [ -f "$PID_FILE" ]; then
+    if [ "$(cat "$PID_FILE")" = $$ ]; then
+      rm -f "$PID_FILE"
+      log_warn "Trap: released $PID_FILE"
+      exit "$rc"
+    else
+      log_warn "We [pid=$$] don't own PID [pid=$(cat "$PID_FILE")] in $PID_FILE"
+    fi
+  fi
+}
+
+get_outputfile() {
+  local filecount=${1:-}
+  local extension=ts
+  if [ -z "$OUTPUTFILE_BASE" ]; then
+    OUTPUTFILE_BASE="${SCRIPTBASE}-$(date +%Y%m%d-%H%M)"
+  fi
+  if [ -z "$filecount" ]; then
+    output_file="${OUTPUTFILE_BASE}.${extension}"
+  else
+    output_file="${OUTPUTFILE_BASE}-${filecount}.${extension}"
+  fi
+  if [ -f "$output_file" ]; then
+    die "ERROR: output file exists: $output_file"
+  fi
+  echo "$output_file"
+}
+
+do_streamlink_player() {
+  local player=$1
+  local quality=${2:-best}
+  streamlink --player "$player" https://pickleballtv.com "${quality}"
+}
+
+do_streamlink_record() {
+  local output_file=${1:-}
+  local quality=${2:-best}
+  log_info "$(get_logdate) Starting streamlink quality=$quality -> $output_file"
+  streamlink --output "$output_file" https://pickleballtv.com "${quality}"
+}
+
+do_streamlink_record_with_retries() {
+  # Record in a loop. If streamlink exits we end up with multiple .ts files.
+  local quality=${1:-best}
+  local output_file=
+  local filecount=
+  touch "$RECORDING_SEMAPHORE"
+  while [ -f "$RECORDING_SEMAPHORE" ]; do
+    output_file=$(get_outputfile "$filecount")
+    do_streamlink_record "$output_file" "$quality"
+    rc=$?
+    log_warn "streamlink exited with code: $rc"
+    if [ -z "$filecount" ]; then
+      filecount=1
+    else
+      filecount=$(( filecount + 1 ))
+      sleep 2
+    fi
+  done
+}
+
+main() {
+  local arg_duration_mins=
+  local arg_install=
+  local arg_player=$PBTV_DEFAULT_PLAYER
+  local arg_quality=$PBTV_DEFAULT_QUALITY
+  local arg_record=
+  local arg_sleep=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        help
+        ;;
+      -D|--debug)
+        DEBUG=1
+        ;;
+      -d|--duration|--duration-mins)
+        shift
+        arg_duration_mins=$1
+        ;;
+      --install)
+        arg_install=1
+        ;;
+      -p|--player)
+        shift
+        arg_player=$1
+        ;;
+      -q|--quality)
+        shift
+        arg_quality=$1
+        ;;
+      -r|--record)
+        arg_record=1
+        ;;
+      -s|--sleep-until)
+        shift
+        arg_sleep=$1
+        ;;
+      *)
+        die "Unsupported argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [ -n "$arg_install" ]; then
+    do_install
+    return
+  fi
+  if [ -n "$arg_sleep" ]; then
+    sleep_until "$arg_sleep"
+  fi
+  if [ -z "$arg_record" ]; then
+    do_streamlink_player "$arg_player" "$arg_quality"
+    exit $?
+  fi
+
+  # write the PID of this script into PID_FILE. This will fail if the file exists
+  if ( set -o noclobber; echo "$$" > "$PID_FILE" ) 2> /dev/null; then
+    log_info "Obtained runtime lock $PID_FILE"
+  else
+    die "Failed to obtain runtime lock: $PID_FILE exists"
+  fi
+
+  local duration_secs=
+  if [ ! -z "$arg_duration_mins" ]; then
+    duration_secs=$(( arg_duration_mins * 60 ))
+  fi
+
+  if [ -z "$duration_secs" ]; then
+    log_info "$(get_logdate) Recording"
+    do_streamlink_record_with_retries "$arg_quality"
+  else
+    log_info "$(get_logdate) Recording [duration=${arg_duration_mins}m]"
+    do_streamlink_record_with_retries "$arg_quality" &
+    log_info "$(get_logdate) Sleeping $duration_secs seconds"
+    sleep "$duration_secs"
+    log_info "$(get_logdate) Duration [$duration_secs] expired"
+    shutdown_recording 0
+  fi
+  rm "$PID_FILE"
+}
+
+main "$@" 2>&1 | tee /tmp/"$SCRIPTBASE.log"

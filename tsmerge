@@ -1,0 +1,229 @@
+#!/bin/bash
+# vim: filetype=sh shiftwidth=2 softtabstop=4 expandtab
+set -o nounset;  # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR. Same as 'set -u'
+set -o pipefail; # Catch the error in case a piped command fails
+# set -o errexit;  # Exit on error. Append "|| true" if you expect an error. Same as 'set -e'
+# set -o errtrace; # Exit on error inside any functions or subshells. Same as 'set -E'
+# set -o xtrace;   # Turn on traces, useful while debugging (short form: on: 'set -x' off: 'set +x')
+# set +o posix     # Turn off posix mode. Required for process substitution
+
+################################################################################
+# Helpers
+
+# shellcheck disable=SC2155
+readonly SCRIPTNAME=$(basename "$0")
+# shellcheck disable=SC2155,SC2034
+readonly SCRIPTDIR=$(readlink -m "$(dirname "$0")")
+
+DEBUG=
+OUTPUT_DIR=
+
+help() {
+cat<<EOF
+Merges multiple .ts files into a single .mp4 file
+
+If no <ts files> are given, then fzf is used to select which files to merge.
+The output file name is derived from the first given file.
+
+The script checks for and ignores any .ts file open for writing.
+
+Requires:
+- ffmpeg
+- fzf (if no .ts files are given)
+- lsof (optional: to check if any .ts file is currently open for writing)
+
+USAGE:
+  $SCRIPTNAME <options> <ts-files>
+
+OPTIONS:
+  -b|--batch <size> : Process .ts files in batches of given size
+  -d|--delete: delete the original .ts files after processing
+  -o|--output <output-file>: full path to the final .mp4 output file (optional)
+
+  -h|--help: print this help
+
+EXAMPLES:
+  $SCRIPTNAME                               # Invokes fzf to select .ts files for merge
+  $SCRIPTNAME file1.ts file2.ts file3.ts    # Merge given .ts files
+  $SCRIPTNAME *.ts                          # Merge all .ts files
+  $SCRIPTNAME -d *.ts                       # As above, but delete the original .ts files
+  $SCRIPTNAME -d -o /media/merged.mp4 *.ts  # As above, but delete the .ts
+                                        # files, and write output to path /media/merged.mp4
+EOF
+exit 1
+}
+
+# Logging: these all log to stderr
+die() { >&2 colorecho red "FATAL: $*"; exit 1; }
+die_with_rc() { local rc=$1; shift; >&2 colorecho red "FATAL: $*, rc=$rc"; exit "$rc"; }
+check_rc_die() { local rc=$1; shift; [ "$rc" != "0" ] && die_with_rc "$rc" "$@"; return 0; }
+log_error() { >&2 colorecho red "ERROR: $*"; }
+log_warn() { >&2 colorecho orange "WARN: $*"; }
+log_info() { >&2 echo "$*"; }
+log_debug() { if [ -n "$DEBUG" ]; then >&2 echo "DEBUG: $*"; fi; }
+log_progress() { >&2 colorecho green "$*"; }
+get_logdate() { date '+%Y-%m-%d %H:%M:%S'; }  # eg: log_info "$(get_logdate) My log message"
+# Optionals to log output to file (see http://mywiki.wooledge.org/BashFAQ/106)
+_init_log() { LOG_FILE="${LOG_FILE:-$(pwd)/${SCRIPTNAME%.*}.log}"; log_progress "$(get_logdate) Logging output to $LOG_FILE"; }
+# output to file only:
+redirect_output_to_file() { _init_log; exec >"$LOG_FILE" 2>&1; }
+# output to console and file:
+tee_output_to_file() { _init_log; exec > >(tee "$LOG_FILE") 2>&1; }
+
+colorecho() {  # usage: colorecho <colour> <text> or colorecho -n <colour> <text>
+  local echo_arg=
+  if [ "$1" = "-n" ]; then echo_arg="-n"; shift; fi
+  local colour="$1"; shift
+  case "${colour}" in
+    red) echo $echo_arg -e "$(tput setaf 1)$*$(tput sgr0)"; ;;
+    green) echo $echo_arg -e "$(tput setaf 2)$*$(tput sgr0)"; ;;
+    green-bold) echo $echo_arg -e "$(tput setaf 2; tput bold)$*$(tput sgr0)"; ;;
+    yellow) echo $echo_arg -e "$(tput setaf 3; tput bold)$*$(tput sgr0)"; ;;
+    orange) echo $echo_arg -e "$(tput setaf 3)$*$(tput sgr0)"; ;;
+    blue) echo $echo_arg -e "$(tput setaf 4)$*$(tput sgr0)"; ;;
+    purple) echo $echo_arg -e "$(tput setaf 5)$*$(tput sgr0)"; ;;
+    cyan) echo $echo_arg -e "$(tput setaf 6)$*$(tput sgr0)"; ;;
+    bold) echo $echo_arg -e "$(tput bold)$*$(tput sgr0)"; ;;
+    normal|*) echo $echo_arg -e "$*"; ;;
+  esac
+}
+
+check_dependency() {
+  local executable=$1
+  if ! hash "$executable" 2>&-; then
+    log_error "Missing dependency (not found in path): $executable"
+    return 1
+  fi
+  return 0
+}
+
+is_file_open() {
+  if hash lsof 2>&-; then
+    lsof 2>/dev/null | grep -q "$1"
+  fi
+}
+
+fzf_get_input_files() {
+  local -n input_files=$1
+  local input_file
+  while read -r input_file; do
+    input_files+=("$input_file")
+  done <<< "$(fzf --multi)"
+}
+
+do_ffmpeg() {
+  local delete=${1:-}
+  shift
+  [ -n "$*" ] || die "No input files given"
+  local -a input_files=("$@")
+  [ ${#input_files[@]} -gt 0 ] || die "No valid input files given"
+  log_info "Using input files:"
+  for item in "${input_files[@]}"; do
+    log_info "${item}"
+  done
+
+  [ -f input.txt ] && rm input.txt
+  touch input.txt
+
+  local video_file
+  local video_file_base=
+  for video_file in "${input_files[@]}"; do
+    if [ -z "$video_file_base" ]; then
+      video_file_base="${video_file%.*}-merge"
+    fi
+    if ! is_file_open "${video_file}"; then
+      echo "file $video_file" >> input.txt
+    else
+      log_warn "File '$video_file' is open (excluding)"
+    fi
+  done
+
+  local output_dir
+  output_dir=$(pwd)
+  if [ -n "$OUTPUT_DIR" ]; then
+    output_dir=$OUTPUT_DIR
+  fi
+  log_progress "ffmpeg concat to .ts"
+  ffmpeg -hide_banner -loglevel warning -f concat -safe 0 -i input.txt -c copy "${video_file_base}.ts"
+
+  log_progress "ffmpeg copy to .mp4"
+  ffmpeg  -hide_banner -loglevel warning -i "${video_file_base}.ts" -acodec copy -vcodec copy "${output_dir}/${video_file_base}.mp4"
+  check_rc_die $? "ffmpeg copy failed"
+
+  log_debug "${video_file_base}.ts:"
+  log_debug "$(ls -alFh "${video_file_base}.ts")"
+  rm "${video_file_base}.ts"
+  rm input.txt
+
+  if [ -n "$delete" ]; then
+    log_progress "Removing original files"
+    for video_file in "${input_files[@]}"; do
+      rm "$video_file"
+    done
+  fi
+}
+
+
+################################################################################
+# Main
+
+main() {
+  local arg_batch_size=
+  local arg_delete=
+  local -a arg_files=()
+  while [ $# -gt 0 ] ; do
+    case "${1:-""}" in
+      -h|--help)
+        help
+        ;;
+      -D|--debug)
+        DEBUG=1
+        ;;
+      -b|--batch)
+        shift
+        arg_batch_size=$1
+        ;;
+      -d|--delete)
+        arg_delete=1
+        ;;
+      -o|--dir|--directory)
+        shift
+        OUTPUT_DIR=$1
+        [ -d "$OUTPUT_DIR" ] || die "not a directory: $OUTPUT_DIR"
+        ;;
+      -*)
+        die "Unrecognized argument: $1"
+        ;;
+      *)
+        if [ -f "$1" ]; then
+          arg_files+=("$1")
+        else
+          die "Unexpected argument: $1 (not a file)"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  check_dependency ffmpeg || die "Missing dependency: ffmpeg"
+  check_dependency lsof || log_warn "Unable to check if .ts files are open for writing"
+
+  if [ -z "${arg_files[*]}" ]; then
+    check_dependency fzf || die "Missing dependency: fzf"
+    fzf_get_input_files arg_files
+  fi
+  [ ${#arg_files[@]} -gt 0 ] || die "No input files given"
+  if [ -z "${arg_batch_size}" ] || [ "${#arg_files[@]}" -lt "${arg_batch_size}" ]; then
+    do_ffmpeg "$arg_delete" "${arg_files[@]}"
+  else
+    local -i current_index=0
+    while [ "${current_index}" -lt "${#arg_files[@]}" ]; do
+      do_ffmpeg "$arg_delete" "${arg_files[@]:$current_index:$arg_batch_size}"
+      current_index=$(( current_index + arg_batch_size ))
+    done
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi
