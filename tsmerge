@@ -98,10 +98,11 @@ check_dependency() {
 
 is_file_open() {
   local filename=$1
+  local process_name=${2:-streamlink}
   if hash lsof 2>&-; then
-    log_debug "Checking open: $filename"
+    log_debug "Checking file open: $filename"
     local -i count
-    count=$(lsof 2>/dev/null | grep -c "$filename")
+    count=$(lsof -c "$process_name" 2>/dev/null | grep -c "$filename")
     if [ $count -gt 0 ]; then
       log_debug "File is open: $filename"
       return 0
@@ -138,6 +139,7 @@ do_ffmpeg() {
 
   local video_file
   local video_file_base=
+  local -a files_to_remove=()
   for video_file in "${input_files[@]}"; do
     if [ -z "$video_file_base" ]; then
       video_file_base="${video_file%.*}-merge"
@@ -145,6 +147,7 @@ do_ffmpeg() {
     if ! is_file_open "${video_file}"; then
       echo "file $video_file" >> input.txt
       log_debug "Including file $video_file"
+      files_to_remove+=("$video_file")
     else
       log_warn "File $video_file is open (excluding)"
     fi
@@ -171,7 +174,8 @@ do_ffmpeg() {
 
   if [ -n "$delete" ]; then
     log_progress "Removing original files"
-    for video_file in "${input_files[@]}"; do
+    for video_file in "${files_to_remove[@]}"; do
+      log_debug "Removing $video_file"
       rm "$video_file"
     done
   fi
