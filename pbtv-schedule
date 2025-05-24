@@ -1,0 +1,216 @@
+#!/usr/bin/env python
+# vim: set filetype=python
+# -*- coding: utf-8 -*-
+"""Usage: %s [-h ] -d|--days <num>
+
+Required args:
+    -d|--days <num> : number of days to display (0 : all)
+
+"""
+
+import argparse
+import logging
+import os
+import requests
+import sys
+
+from bs4 import BeautifulSoup
+
+PBTV_URL = "https://pickleballtv.com"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+
+DEBUG = False
+VERBOSE = False
+TEST_FILE = "pbtv.html"
+
+
+class Usage(Exception):
+    def __init__(self, msg="", include_doc=False):
+        if msg is None:
+            msg = ""
+        self.msg = msg
+        if include_doc:
+            self.msg += "\n" + __doc__ % (sys.argv[0],)
+
+
+def init_logging(log_file=None, append=False, console_loglevel=logging.INFO):
+    """Set up logging to file and console."""
+    if log_file is not None:
+        filemode_val = "a" if append else "w"
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(threadName)s %(name)s %(message)s",
+            filename=log_file,
+            filemode=filemode_val,
+        )
+        console = logging.StreamHandler()
+        console.setLevel(console_loglevel)
+        formatter = logging.Formatter("%(message)s")
+        console.setFormatter(formatter)
+        logging.getLogger("").addHandler(console)
+    else:
+        logging.basicConfig(
+            level=console_loglevel,
+            format="%(message)s",
+        )
+
+
+def fetch_pbtv_schedule(url):
+    LOG.info(f"Fetching schedule from: {url}")
+    with requests.Session() as session:
+        session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+            }
+        )
+        try:
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            LOG.exception(f"Error: Request to {url} timed out.")
+            raise
+        except requests.exceptions.RequestException as e:
+            LOG.exception(f"Error fetching data from {url}: {e}")
+            raise
+    return response.content
+
+
+def parse_schedule_tab_buttons(soup):
+    # Locate the schedule tabs container
+    schedule_tabs_ul = soup.find("ul", id="schedule-tabs")
+    button_data = []
+    if schedule_tabs_ul:
+        # Find all button elements within the UL
+        buttons = schedule_tabs_ul.find_all("button")
+        for button in buttons:
+            button_id = button.get(
+                "id"
+            )
+            data_bs_target = button.get("data-bs-target")
+            aria_controls = button.get("aria-controls")
+            # Find month and day spans within the button
+            month_span = button.find("span", class_="month")
+            day_span = button.find("span", class_="day")
+
+            # Extract text from spans, with error handling in case spans are missing
+            month_text = month_span.get_text(strip=True) if month_span else ""
+            day_text = day_span.get_text(strip=True) if day_span else ""
+
+            button_data.append(
+                {
+                    "id": button_id,
+                    "aria-controls": aria_controls,
+                    "data-bs-target": data_bs_target,
+                    "month": month_text,
+                    "day": day_text,
+                }
+            )
+
+    LOG.debug("Extracted Button Data:")
+    for item in button_data:
+        LOG.debug(item)
+    return button_data
+
+
+def parse_pbtv_schedule(content):
+    soup = BeautifulSoup(content, "html.parser")
+
+    tab_buttons = parse_schedule_tab_buttons(soup)
+    LOG.debug(f"button_data: {tab_buttons}")
+
+    schedule = {}
+    for tab_data in tab_buttons:
+        LOG.debug(f"----- {tab_data['month']} {tab_data['day']} -----")
+        tab_pane = soup.find("div", attrs={"aria-labelledby": tab_data["id"]})
+        if not tab_pane:
+            LOG.warning(f"No tab pane found for {tab_data['id']}")
+            continue
+
+        # Identify the container for each schedule entry
+        # Based on context, '.single-timeslot' seems to be the parent container.
+        schedule_entries = tab_pane.find_all("div", class_="single-timeslot")
+        schedule_data = []
+
+        for entry in schedule_entries:
+            time_div = entry.find("div", class_="time")
+            title_div = entry.find("div", class_="title")
+
+            if time_div and title_div:
+                # Extract text and clean it up (strip whitespace)
+                time_text = time_div.get_text(separator=" ", strip=True)
+                title_text = title_div.get_text(separator=" ", strip=True)
+                title = ""
+                for ll in title_text.splitlines():
+                    title += f" {ll.strip()}"
+                schedule_data.append((time_text, title))
+                LOG.debug(f"{time_text}: {title}")
+
+        date_key = f"{tab_data['month']} {tab_data['day']}"
+        schedule[date_key] = schedule_data
+
+    return schedule
+
+
+def print_schedule(schedule, num_days=0):
+    count_days = 0
+    for date in schedule:
+        print(f"---------- {date} ----------")
+        for item in schedule[date]:
+            print(f"{item[0]:>12}: {item[1]}")
+        count_days += 1
+        if num_days > 0 and count_days >= num_days:
+            return
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Display schedule from pickleballtv.com",
+        #epilog="My footer text",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-d", "--days", type=int, action="store", default=0, help="Number of days to output")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help=argparse.SUPPRESS
+    )  # help="Increase output verbosity")
+    parser.add_argument(
+        "-D", "--debug", action="store_true", help=argparse.SUPPRESS
+    )  # help="Turn on debug output")
+
+    args = parser.parse_args()
+
+    if args.debug:
+        global DEBUG
+        DEBUG = True
+    if args.verbose:
+        global VERBOSE
+        VERBOSE = True
+
+    console_level = logging.DEBUG if DEBUG else logging.INFO
+    log_file = (
+        f"{os.path.splitext(os.path.basename(sys.argv[0]))[0]}.log"
+        if DEBUG
+        else None
+    )
+    init_logging(log_file, append=DEBUG, console_loglevel=console_level)
+    global LOG
+    LOG = logging.getLogger(__name__)
+
+    if DEBUG and os.path.exists(TEST_FILE):
+        with open(TEST_FILE, "r") as ff:
+            content = ff.read()
+    else:
+        content = fetch_pbtv_schedule(PBTV_URL)
+        if DEBUG:
+            with open(TEST_FILE, "w") as ff:
+                ff.writelines(content)
+
+    schedule = parse_pbtv_schedule(content)
+    if schedule:
+        print_schedule(schedule, args.days)
+    else:
+        LOG.error("Could not fetch and parse schedule or no data found.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
