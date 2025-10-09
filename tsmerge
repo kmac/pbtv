@@ -29,6 +29,7 @@ The script checks for and ignores any .ts file open for writing.
 Requires:
 - ffmpeg
 - fzf (if no .ts files are given)
+- fd (if no .ts files are given)
 - lsof (optional: to check if any .ts file is currently open for writing)
 
 USAGE:
@@ -37,7 +38,7 @@ USAGE:
 OPTIONS:
   -b|--batch <size> : Process .ts files in batches of given size
   -d|--delete: delete the original .ts files after processing
-  -o|--output <output-file>: full path to the final .mp4 output file (optional)
+  -o|--output <output-dir>: output directory (optional)
 
   -h|--help: print this help
 
@@ -46,8 +47,7 @@ EXAMPLES:
   $SCRIPTNAME file1.ts file2.ts file3.ts    # Merge given .ts files
   $SCRIPTNAME *.ts                          # Merge all .ts files
   $SCRIPTNAME -d *.ts                       # As above, but delete the original .ts files
-  $SCRIPTNAME -d -o /media/merged.mp4 *.ts  # As above, but delete the .ts
-                                        # files, and write output to path /media/merged.mp4
+  $SCRIPTNAME -d -o /media *.ts             # Write output to path /media
 EOF
 exit 1
 }
@@ -120,7 +120,7 @@ fzf_get_input_files() {
   local input_file
   while read -r input_file; do
     input_files+=("$input_file")
-  done <<< "$(fzf --multi)"
+  done <<< "$(fzf --multi --no-sort < <(fd --extension ts))"
 }
 
 do_ffmpeg() {
@@ -142,7 +142,8 @@ do_ffmpeg() {
   local -a files_to_remove=()
   for video_file in "${input_files[@]}"; do
     if [ -z "$video_file_base" ]; then
-      video_file_base="${video_file%.*}-merge"
+      # strip off extension from the first file, use it as base
+      video_file_base="${video_file%.*}"
     fi
     if ! is_file_open "${video_file}"; then
       echo "file $video_file" >> input.txt
@@ -158,16 +159,18 @@ do_ffmpeg() {
   if [ -n "$OUTPUT_DIR" ]; then
     output_dir=$OUTPUT_DIR
   fi
-  log_progress "ffmpeg concat to .ts"
-  ffmpeg -hide_banner -loglevel warning -f concat -safe 0 -i input.txt -c copy "${video_file_base}.ts"
+  local merge_file="${video_file_base}-merge.ts"
+  log_progress "ffmpeg concat to ${merge_file}"
+  ffmpeg -hide_banner -loglevel warning -f concat -safe 0 -i input.txt -c copy "${merge_file}"
 
+  local mp4_file="${video_file_base}.mp4"
   log_progress "ffmpeg copy to .mp4"
-  ffmpeg  -hide_banner -loglevel warning -i "${video_file_base}.ts" -acodec copy -vcodec copy "${output_dir}/${video_file_base}.mp4"
+  ffmpeg  -hide_banner -loglevel warning -i "${merge_file}" -acodec copy -vcodec copy "${output_dir}/${mp4_file}"
   check_rc_die $? "ffmpeg copy failed"
 
-  log_debug "${video_file_base}.ts:"
-  log_debug "$(ls -alFh "${video_file_base}.ts")"
-  rm "${video_file_base}.ts"
+  log_debug "${merge_file}:"
+  log_debug "$(ls -alFh "${merge_file}")"
+  rm "${merge_file}"
   if [ -z "$DEBUG" ]; then
     rm input.txt
   fi
