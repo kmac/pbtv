@@ -169,7 +169,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-d", "--days", type=int, action="store", default=0, help="Number of days to output")
+        "-d", "--days", type=int, action="store", default=2, help="Number of days to output")
     parser.add_argument(
         "-v", "--verbose", action="store_true", help=argparse.SUPPRESS
     )  # help="Increase output verbosity")
