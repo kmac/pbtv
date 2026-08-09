@@ -1,2 +1,4 @@
 *.*vim
+*.log
+*.m3u8
 __pycache__
