@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timedelta
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bs4 import BeautifulSoup
 
@@ -199,7 +200,13 @@ def make_datetime(month_str, day_str, time_str, year):
     return datetime(year, month, day, hour, minute)
 
 
-def build_epg_xml(schedule, tvg_id, tvg_name, tz_offset, num_days=0):
+def build_epg_xml(schedule, tvg_id, tvg_name, timezone_name, num_days=0):
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        LOG.error(f"Unknown timezone: {timezone_name}")
+        raise
+
     now = datetime.now()
     current_year = now.year
 
@@ -220,7 +227,7 @@ def build_epg_xml(schedule, tvg_id, tvg_name, tz_offset, num_days=0):
         for time_text, title in entries:
             dt = make_datetime(month_str, day_str, time_text, year)
             if dt:
-                programmes.append((dt, title.strip()))
+                programmes.append((dt.replace(tzinfo=tz), title.strip()))
 
         count_days += 1
         if num_days > 0 and count_days >= num_days:
@@ -245,11 +252,11 @@ def build_epg_xml(schedule, tvg_id, tvg_name, tz_offset, num_days=0):
         prog = SubElement(tv, "programme")
         prog.set(
             "start",
-            start_dt.strftime("%Y%m%d%H%M%S") + " " + tz_offset,
+            start_dt.strftime("%Y%m%d%H%M%S %z"),
         )
         prog.set(
             "stop",
-            end_dt.strftime("%Y%m%d%H%M%S") + " " + tz_offset,
+            end_dt.strftime("%Y%m%d%H%M%S %z"),
         )
         prog.set("channel", tvg_id)
 
@@ -281,8 +288,9 @@ def main():
         "--tvg-name", type=str, default="Pickleball TV",
         help="Channel display name for EPG output (default: 'Pickleball TV')")
     parser.add_argument(
-        "--epg-timezone", type=str, default="-0500",
-        help="Timezone offset for EPG times, e.g. -0500 for EST (default: -0500)")
+        "--epg-timezone", type=str, default="America/Toronto",
+        help="Timezone for EPG times (default: America/Toronto). "
+             "Any Linux zoneinfo name, e.g. America/New_York")
     parser.add_argument(
         "-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -322,11 +330,15 @@ def main():
         return
 
     if args.epg:
-        xml_str = build_epg_xml(
-            schedule, args.tvg_id, args.tvg_name, args.epg_timezone, args.days)
+        try:
+            xml_str = build_epg_xml(
+                schedule, args.tvg_id, args.tvg_name, args.epg_timezone, args.days)
+        except ZoneInfoNotFoundError:
+            return 1
         print(xml_str)
     else:
         print_schedule(schedule, args.days)
+    return 0
 
 
 if __name__ == "__main__":

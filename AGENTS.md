@@ -42,7 +42,7 @@ python3 pbtv-schedule -d 3
 
 # Generate XMLTV EPG XML (for IPTV channel guide)
 python3 pbtv-schedule --epg -d 7
-python3 pbtv-schedule --epg -d 7 --tvg-id "pickleball.tv" --tvg-name "Pickleball TV" --epg-timezone "-0500"
+python3 pbtv-schedule --epg -d 7 --tvg-id "pickleball.tv" --tvg-name "Pickleball TV" --epg-timezone "America/New_York"
 ```
 
 ## Environment variables
